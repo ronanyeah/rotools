@@ -1,6 +1,6 @@
 [package]
 name = "rotools"
-version = "0.1.0"
+version = "0.2.1"
 edition = "2018"
 license = "MIT"
 description = "Helpful stuff."
@@ -10,8 +10,9 @@ keywords = ["ronan"]
 categories = ["web-programming"]
 
 [dependencies]
+anyhow = "1.0.57"
 graphql_client = "0.10.0"
-reqwest = { version = "0.11.5", features = ["json"] }
-serde = "1.0.130"
-serde_json = "1.0.68"
+reqwest = { version = "0.11.10", features = ["json"] }
+serde = "1.0.137"
+serde_json = "1.0.81"
 url = "2.2.2"
