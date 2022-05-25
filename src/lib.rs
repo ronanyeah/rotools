@@ -10,7 +10,7 @@ pub struct HasuraInternalError {
 
 #[derive(serde::Deserialize, serde::Serialize, Debug)]
 pub struct HasuraErrors {
-    pub hasura_errors: Vec<ParsedError>,
+    pub errors: Vec<ParsedError>,
 }
 
 #[derive(serde::Deserialize, serde::Serialize, Debug)]
@@ -43,7 +43,7 @@ impl fmt::Display for HasuraErrors {
         write!(
             f,
             "{}",
-            serde_json::to_string_pretty(self).map_err(|_| fmt::Error)?
+            serde_json::to_string_pretty(&self.errors).map_err(|_| fmt::Error)?
         )
     }
 }
@@ -59,9 +59,11 @@ mod tests {
 pub async fn graphql_request<D: serde::de::DeserializeOwned>(
     req: reqwest::RequestBuilder,
 ) -> anyhow::Result<graphql_client::Response<D>> {
-    let data = req.send().await?;
+    let res = req.send().await?;
 
-    let decode: graphql_client::Response<D> = data.json().await?;
+    let res_ok = res.error_for_status()?;
+
+    let decode: graphql_client::Response<D> = res_ok.json().await?;
 
     Ok(decode)
 }
@@ -74,7 +76,7 @@ pub async fn graphql_parse<D: serde::de::DeserializeOwned>(
         None => match body.errors {
             Some(errors) => {
                 let xs: Vec<_> = errors.into_iter().map(parse_error).collect();
-                let ctx = HasuraErrors { hasura_errors: xs };
+                let ctx = HasuraErrors { errors: xs };
                 Err(anyhow!(ctx))
             }
             None => Err(anyhow!("Hasura: No data or errors")),
