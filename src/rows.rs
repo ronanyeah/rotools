@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+use std::fs::{self, File};
+use std::io::{BufReader, BufWriter};
 use std::{cmp::Ord, fmt::Display};
 
 pub trait HasId {
@@ -16,12 +18,12 @@ impl<S> Rows<S>
 where
     S: serde::Serialize + serde::de::DeserializeOwned + HasId + Clone,
 {
-    pub fn new(path: &str) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn new(path: &str) -> anyhow::Result<Self> {
         let mut url = std::path::PathBuf::new();
         url.push(path);
 
         if url.extension().map_or(true, |ext| ext != "csv") {
-            return Err("Bad extension!")?;
+            return Err(anyhow::anyhow!("Bad extension!"))?;
         }
 
         // TODO should check file exists and/or is valid?
@@ -57,63 +59,52 @@ where
 
         Ok(())
     }
-    pub fn update(&self, new_piece: &S) -> anyhow::Result<()> {
-        let all = self.read_all()?;
-
-        let new_xs: Vec<_> = all
-            .into_iter()
-            .map(|x| {
-                if x.id() == new_piece.id() {
-                    new_piece.clone()
-                } else {
-                    x
-                }
-            })
-            .collect();
-
-        self.overwrite(new_xs)?;
-
-        Ok(())
+    pub fn update(&self, data: S) -> anyhow::Result<()> {
+        self.update_multiple(vec![data])
     }
-    pub fn update_multiple(&self, new_pieces: Vec<S>) -> anyhow::Result<()> {
-        if new_pieces.is_empty() {
+    pub fn update_multiple(&self, data: Vec<S>) -> anyhow::Result<()> {
+        if data.is_empty() {
             return Ok(());
         }
 
-        let updates: HashMap<<S as HasId>::Id, S> = new_pieces
+        let updates: HashMap<<S as HasId>::Id, S> = data
             .into_iter()
             .map(|piece| (piece.id().clone(), piece))
             .collect();
 
-        let all = self.read_all()?;
-
-        let new_xs: Vec<_> = all
-            .into_iter()
-            .map(|x| updates.get(&x.id()).cloned().unwrap_or(x))
-            .collect();
-
-        self.overwrite(new_xs)?;
-
-        Ok(())
+        self.with_temp_file(|writer, reader| {
+            for result in reader.deserialize() {
+                let record: S = result?;
+                let updated = updates.get(&record.id()).cloned();
+                if let Some(new_record) = updated {
+                    writer.serialize(new_record)?;
+                } else {
+                    writer.serialize(record)?;
+                }
+            }
+            Ok(())
+        })
     }
-    pub fn delete(&self, id: &<S as HasId>::Id) -> Result<(), Box<dyn std::error::Error>> {
-        let all = self.read_all()?;
-
-        let new_xs: Vec<_> = all
-            .into_iter()
-            .filter_map(|x| if x.id() == *id { None } else { Some(x) })
-            .collect();
-
-        self.overwrite(new_xs)?;
-
-        Ok(())
+    pub fn delete(&self, id: &<S as HasId>::Id) -> anyhow::Result<()> {
+        if !self.member(id)? {
+            return Ok(());
+        }
+        self.with_temp_file(|writer, reader| {
+            for result in reader.deserialize() {
+                let record: S = result?;
+                if record.id() != *id {
+                    writer.serialize(record)?;
+                }
+            }
+            Ok(())
+        })
     }
-    pub fn get(&self, id: &<S as HasId>::Id) -> Result<Option<S>, Box<dyn std::error::Error>> {
+    pub fn get(&self, id: &<S as HasId>::Id) -> anyhow::Result<Option<S>> {
         let all = self.read_all()?;
 
         Ok(all.into_iter().find(|x| x.id() == *id))
     }
-    pub fn member(&self, id: &<S as HasId>::Id) -> Result<bool, Box<dyn std::error::Error>> {
+    pub fn member(&self, id: &<S as HasId>::Id) -> anyhow::Result<bool> {
         let all = self.read_all()?;
 
         Ok(all.iter().any(|x| x.id() == *id))
@@ -134,13 +125,13 @@ where
 
         Ok(())
     }
-    pub fn drop(&self) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn drop(&self) -> anyhow::Result<()> {
         std::fs::File::create(&self.path)?;
 
         Ok(())
     }
     pub fn read_all(&self) -> anyhow::Result<Vec<S>> {
-        let mut read = csv::Reader::from_path(&self.path)?;
+        let mut read = self.csv_reader()?;
         let rdr = read.deserialize::<S>().collect::<Vec<_>>();
         let res: Result<Vec<_>, _> = rdr.into_iter().collect();
         Ok(res?)
@@ -155,28 +146,68 @@ where
             .collect();
         Ok(res)
     }
-    pub fn size(&self) -> Result<usize, Box<dyn std::error::Error>> {
+    pub fn size(&self) -> anyhow::Result<usize> {
         let xs = self.read_all()?;
         Ok(xs.len())
+    }
+
+    // private
+    fn csv_reader(&self) -> anyhow::Result<csv::Reader<BufReader<File>>> {
+        let file = File::open(&self.path)?;
+        let reader = csv::Reader::from_reader(BufReader::new(file));
+        Ok(reader)
+    }
+    fn with_temp_file<F>(&self, f: F) -> anyhow::Result<()>
+    where
+        F: FnOnce(
+            &mut csv::Writer<BufWriter<File>>,
+            &mut csv::Reader<BufReader<File>>,
+        ) -> anyhow::Result<()>,
+    {
+        let temp_path = self.path.with_extension("csv.tmp");
+
+        let mut reader = self.csv_reader()?;
+        let output = File::create(&temp_path)?;
+        let mut writer = csv::WriterBuilder::new()
+            .has_headers(reader.position().byte() == 0)
+            .from_writer(BufWriter::new(output));
+
+        f(&mut writer, &mut reader)?;
+        writer.flush()?;
+
+        fs::rename(&temp_path, &self.path)?;
+
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rand::Rng;
 
-    #[derive(Default, serde::Serialize, serde::Deserialize, Clone)]
+    #[derive(serde::Serialize, serde::Deserialize, Clone)]
     struct Scaf {
         id: u64,
         ok: bool,
         amount: i32,
     }
 
+    impl Default for Scaf {
+        fn default() -> Self {
+            Scaf {
+                id: rand::rng().random(),
+                ok: rand::rng().random(),
+                amount: rand::rng().random(),
+            }
+        }
+    }
+
     impl HasId for Scaf {
         type Id = u64;
 
-        fn id(&self) -> &Self::Id {
-            &self.id
+        fn id(&self) -> Self::Id {
+            self.id
         }
     }
 
@@ -203,21 +234,46 @@ mod tests {
     }
 
     #[test]
-    fn test_insert() {
+    fn test_insert_delete() {
         let db = Rows::<Scaf>::new(&get_path()).unwrap();
 
         let new_piece = Scaf::default();
-        db.insert(&new_piece).unwrap();
+        db.insert(new_piece.clone()).unwrap();
         assert!(db.member(&new_piece.id).unwrap());
         assert!(db.get(&new_piece.id).unwrap().is_some());
         assert_eq!(db.read_all().unwrap().len(), 1);
 
-        db.insert(&Scaf::default()).unwrap();
+        db.insert(Scaf::default()).unwrap();
         assert_eq!(db.read_all().unwrap().len(), 2);
 
-        // TODO: test delete and update
+        db.insert(Scaf::default()).unwrap();
+        assert_eq!(db.read_all().unwrap().len(), 3);
+
         db.delete(&new_piece.id).unwrap();
-        assert_eq!(db.read_all().unwrap().len(), 1);
+        assert_eq!(db.read_all().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_multiple() {
+        let db = Rows::<Scaf>::new(&get_path()).unwrap();
+
+        let mut s1 = Scaf::default();
+        let mut s2 = Scaf::default();
+        let s3 = Scaf::default();
+        let s4 = Scaf::default();
+
+        db.insert_multiple(vec![s1.clone(), s2.clone(), s3, s4])
+            .unwrap();
+        assert_eq!(db.read_all().unwrap().len(), 4);
+
+        s1.amount = 111;
+        s2.amount = 222;
+
+        db.update_multiple(vec![s1.clone(), s2.clone()]).unwrap();
+        assert_eq!(db.read_all().unwrap().len(), 4);
+
+        assert!(db.get(&s1.id).unwrap().unwrap().amount == 111);
+        assert!(db.get(&s2.id).unwrap().unwrap().amount == 222);
     }
 
     #[test]
