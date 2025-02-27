@@ -1,7 +1,7 @@
 [package]
 name = "rotools"
 version = "0.3.0"
-edition = "2018"
+edition = "2024"
 license = "MIT"
 description = "Helpful stuff."
 homepage = "https://ronanmccabe.app/"
